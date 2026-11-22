@@ -1,0 +1,78 @@
+name: Reusable FinOps Cache Janitor & Quota Report
+
+on:
+  workflow_call:
+    inputs:
+      max-age-days:
+        description: 'Delete non-main caches older than N days'
+        required: false
+        type: number
+        default: 7
+
+jobs:
+  cleanup_and_report:
+    name: Prune Stale Caches & Report Quota
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Prune stale PR/branch caches and summarize usage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_AGE_DAYS: ${{ inputs.max-age-days }}
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os, subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          max_age = int(os.environ.get("MAX_AGE_DAYS", "7"))
+          cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=max_age)
+
+          raw = subprocess.check_output(
+              ["gh", "api", "--paginate", f"repos/{repo}/actions/caches"],
+              text=True,
+          )
+          # gh api --paginate returns concatenated JSON objects per page or merged array depending on flag
+          caches = []
+          for line in raw.strip().splitlines():
+              if not line.strip():
+                  continue
+              obj = json.loads(line)
+              caches.extend(obj.get("actions_caches", []))
+
+          total_bytes = sum(c.get("size_in_bytes", 0) for c in caches)
+          deleted_count = 0
+          freed_bytes = 0
+
+          for c in caches:
+              ref = c.get("ref", "")
+              last_used_str = c.get("last_accessed_at") or c.get("created_at")
+              if not last_used_str:
+                  continue
+              last_used = datetime.datetime.fromisoformat(last_used_str.replace("Z", "+00:00"))
+              # Keep default branch caches; prune non-main/PR caches older than cutoff
+              if ref not in ("refs/heads/main", "refs/heads/master") and last_used < cutoff:
+                  cid = c["id"]
+                  subprocess.run(
+                      ["gh", "api", "-X", "DELETE", f"repos/{repo}/actions/caches/{cid}"],
+                      check=False,
+                  )
+                  deleted_count += 1
+                  freed_bytes += c.get("size_in_bytes", 0)
+
+          total_mb = total_bytes / (1024 * 1024)
+          freed_mb = freed_bytes / (1024 * 1024)
+          pct_of_10gb = (total_bytes / (10 * 1024 * 1024 * 1024)) * 100
+
+          summary = [
+              f"### FinOps Summary (`{repo}`)",
+              f"- **Active caches before cleanup:** {len(caches)} ({total_mb:.1f} MB / 10240 MB limit, {pct_of_10gb:.2f}%)",
+              f"- **Pruned stale branch caches (> {max_age}d):** {deleted_count} ({freed_mb:.1f} MB freed)",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("\n".join(summary) + "\n")
+          print("\n".join(summary))
+          PY

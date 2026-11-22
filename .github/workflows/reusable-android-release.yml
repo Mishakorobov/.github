@@ -1,0 +1,141 @@
+name: Reusable Android Release Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      artifact-prefix:
+        description: 'Filename prefix for release APK (e.g. bilet_vohr_2026)'
+        required: true
+        type: string
+      release-title-prefix:
+        description: 'Release title suffix (e.g. Официальные билеты ВОХР 2026)'
+        required: true
+        type: string
+      flutter-version:
+        description: 'Pinned Flutter SDK version'
+        required: false
+        type: string
+        default: '3.38.9'
+      prerelease:
+        description: 'Mark GitHub Release as prerelease'
+        required: false
+        type: boolean
+        default: false
+      tag-override:
+        description: 'Optional release tag when run via workflow_dispatch (defaults to v<pubspec version>)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  release_build:
+    name: Verify, Build & Publish Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Resolve and validate release version
+        id: ver
+        env:
+          TAG_OVERRIDE: ${{ inputs.tag-override }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          with open('pubspec.yaml', 'r', encoding='utf-8') as f:
+              content = f.read()
+          m = re.search(r'^version:\s*([0-9]+\.[0-9]+\.[0-9]+)(?:\+[0-9]+)?', content, re.MULTILINE)
+          if not m:
+              print("Error: Could not parse version in pubspec.yaml", file=sys.stderr)
+              sys.exit(1)
+          pub_ver = m.group(1)
+          ref_type = os.environ.get('GITHUB_REF_TYPE', '')
+          ref_name = os.environ.get('GITHUB_REF_NAME', '')
+          override = os.environ.get('TAG_OVERRIDE', '').strip()
+
+          if ref_type == 'tag':
+              tag = ref_name
+              clean_tag = tag[1:] if tag.startswith('v') else tag
+              if clean_tag != pub_ver:
+                  print(f"Error: Git tag ({tag}) does not match pubspec.yaml version ({pub_ver})", file=sys.stderr)
+                  sys.exit(1)
+          else:
+              tag = override if override else f"v{pub_ver}"
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write(f"version={pub_ver}\n")
+              out.write(f"tag={tag}\n")
+          print(f"Resolved release: tag={tag}, version={pub_ver}")
+          PY
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter-version }}
+          channel: 'stable'
+          cache: true
+
+      - name: Setup Gradle & Cache
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: false
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Static analysis
+        run: flutter analyze --no-fatal-infos
+
+      - name: Run all tests
+        run: flutter test
+
+      - name: Ensure Gradle wrapper is executable
+        run: test -f android/gradlew && chmod +x android/gradlew || true
+
+      - name: Build Release APK
+        run: flutter build apk --release --android-skip-build-dependency-validation
+
+      - name: Package release assets and SHA-256 checksums
+        id: pkg
+        run: |
+          mkdir -p release_assets
+          APK_NAME="${{ inputs.artifact-prefix }}_${{ steps.ver.outputs.tag }}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "release_assets/${APK_NAME}"
+          (cd release_assets && sha256sum "${APK_NAME}" > SHA256SUMS.txt)
+          cat release_assets/SHA256SUMS.txt
+          if [ -f build/app/outputs/mapping/release/mapping.txt ]; then
+            echo "has_mapping=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_mapping=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload R8 mapping (3-day retention)
+        if: steps.pkg.outputs.has_mapping == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: r8-mapping-${{ steps.ver.outputs.tag }}
+          path: build/app/outputs/mapping/release/mapping.txt
+          retention-days: 3
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "Релиз ${{ steps.ver.outputs.version }}: ${{ inputs.release-title-prefix }}"
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            release_assets/*.apk
+            release_assets/SHA256SUMS.txt
